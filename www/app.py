@@ -10,7 +10,7 @@ Application run
 import logging;
 logging.basicConfig(level=logging.INFO)
 
-import asyncio, os, json, time
+import asyncio, os, json, time, re
 from datetime import datetime
 from aiohttp import web
 from jinja2 import Environment, FileSystemLoader
@@ -18,7 +18,9 @@ from jinja2 import Environment, FileSystemLoader
 import orm
 from config import configs
 from coroweb import add_routes, add_static
-from handlers import cookie2user, COOKIE_NAME
+from cookies import cookie2user, COOKIE_NAME
+from apis_Except import APIPermissionError
+from models import User, Group
 
 def init_jinja2(app, **kw):
     logging.info('初始化jinja2....')
@@ -43,7 +45,7 @@ def init_jinja2(app, **kw):
 def logger_factory(app, handler):
     @asyncio.coroutine
     def logger(request):
-        logging.info('请求:% %' % (request.method, request.path))
+        logging.info('请求:%s %s' % (request.method, request.path))
         return(yield from handler(request))
     return(logger)
 
@@ -51,6 +53,7 @@ def logger_factory(app, handler):
 def auth_factory(app, handler):
     @asyncio.coroutine
     def auth(request):
+        referer = request.headers.get('Referer')
         logging.info('检查用户: %s %s' % (request.method, request.path))
         request.__user__ = None
         cookie_str = request.cookies.get(COOKIE_NAME)
@@ -59,9 +62,28 @@ def auth_factory(app, handler):
             if user:
                 logging.info('当前用户为: %s' % user.email)
                 request.__user__ = user
-        if yield from check_auth(user):
-            return(web.HTTPFound('/signin'))
-        return(yield from handler(request))
+                if request.path == '/400' or request.path == '500' or re.compile(r'^\/favicon.ico$').match(request.path) or re.compile(r'^\/$').match(request.path) or re.compile(r'^\/static\/.*').match(request.path) or re.compile(r'^\/signin$').match(request.path) or re.compile(r'^\/register$').match(request.path) or re.compile(r'^\/api\/authenticate$').match(request.path) or re.compile(r'^\/signout$').match(request.path):
+                    return(yield from handler(request))
+                @asyncio.coroutine
+                def check_auth(user):
+                    permission_path_list = list()
+                    for groupid in user.groups.split(';'):
+                        group_obj = yield from Group.find(groupid)
+                        permission_path_list.extend(group_obj.permission_path.split(';'))
+                    for permission_path in permission_path_list:
+                        if re.compile(permission_path).match(request.path):
+                            return True
+                    return False
+                user_permission = yield from check_auth(user)
+                if not user_permission:
+                    return(web.HTTPFound(referer or '/400'))
+                else:
+                    return(yield from handler(request))
+        elif request.path == '/400' or request.path == '500' or re.compile(r'^\/favicon.ico$').match(request.path) or re.compile(r'^\/$').match(request.path) or re.compile(r'^\/static\/.*').match(request.path) or re.compile(r'^\/signin$').match(request.path) or re.compile(r'^\/register$').match(request.path) or re.compile(r'^\/api\/authenticate$').match(request.path):
+            return(yield from handler(request))
+        else:
+            return(web.HTTPFound(referer or '/400'))
+           # return(web.HTTPForbidden())
     return(auth)
 
 @asyncio.coroutine
@@ -133,7 +155,7 @@ def datetime_filter(t):
 
 @asyncio.coroutine
 def init(loop):
-    yield from orm.create_pool(loop=loop, **config.db)
+    yield from orm.create_pool(loop=loop, **configs.db)
     app = web.Application(loop=loop, middlewares=[
         logger_factory, auth_factory, response_factory
 #        logger_factory, auth_factory, response_factory, data_factory 
@@ -141,7 +163,9 @@ def init(loop):
     init_jinja2(app, filters=dict(datetime=datetime_filter))
     add_routes(app, 'userregAlogin')
 #用户添加访问逻辑
-#    add_routes(app, 'handlers')
+    add_routes(app, 'handlers')
+    add_routes(app, 'errors')
+    add_routes(app, 'admins')
     add_static(app)
     srv = yield from loop.create_server(app.make_handler(), '0.0.0.0', 8888)
     logging.info('服务在http://192.168.1.53:8888开始运行...')
